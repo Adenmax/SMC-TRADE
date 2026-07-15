@@ -1,0 +1,198 @@
+//@version=5
+indicator("SMC Signals - BOS/CHoCH/OB/FVG/Liquidity Sweeps", shorttitle="SMC Signals", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ============================== INPUTS ==============================
+swingLen      = input.int(5, "Swing Lookback (bars each side)", minval=2, group="Structure")
+obMaxAge      = input.int(80, "Order Block Max Age (bars)", minval=10, group="Order Blocks")
+obSearchBack  = input.int(15, "OB Search-back Window (bars)", minval=3, maxval=40, group="Order Blocks")
+fvgMaxAge     = input.int(60, "FVG Max Age (bars)", minval=10, group="Fair Value Gaps")
+showFVG       = input.bool(true, "Show Fair Value Gaps", group="Fair Value Gaps")
+showOB        = input.bool(true, "Show Order Blocks", group="Order Blocks")
+showStructure = input.bool(true, "Show BOS / CHoCH Labels", group="Structure")
+showSweeps    = input.bool(true, "Show Liquidity Sweeps", group="Liquidity")
+showZone      = input.bool(true, "Show Premium / Discount Zone", group="Zones")
+atrLen        = input.int(14, "ATR Length (sweep filter)", group="Liquidity")
+minSweepATR   = input.float(0.15, "Min Sweep Wick (x ATR)", minval=0, step=0.05, group="Liquidity")
+
+bullBoxColor = color.new(color.teal, 80)
+bearBoxColor = color.new(color.red, 80)
+fvgBullColor = color.new(color.blue, 85)
+fvgBearColor = color.new(color.orange, 85)
+
+// ============================== SWING / STRUCTURE ==============================
+ph = ta.pivothigh(high, swingLen, swingLen)
+pl = ta.pivotlow(low, swingLen, swingLen)
+
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+
+if not na(ph)
+    lastSwingHigh := ph
+if not na(pl)
+    lastSwingLow := pl
+
+var int trend = 0 // 1 = bullish structure, -1 = bearish structure, 0 = undefined
+
+bullBreak = not na(lastSwingHigh) and ta.crossover(close, lastSwingHigh)
+bearBreak = not na(lastSwingLow)  and ta.crossunder(close, lastSwingLow)
+
+bullishCHoCH = false
+bullishBOS   = false
+bearishCHoCH = false
+bearishBOS   = false
+
+if bullBreak
+    if trend <= 0
+        bullishCHoCH := true
+    else
+        bullishBOS := true
+    trend := 1
+
+if bearBreak
+    if trend >= 0
+        bearishCHoCH := true
+    else
+        bearishBOS := true
+    trend := -1
+
+if showStructure
+    if bullishCHoCH
+        label.new(bar_index, low, "CHoCH+", style=label.style_label_up, color=color.new(color.lime, 0), textcolor=color.black, size=size.small)
+    if bullishBOS
+        label.new(bar_index, low, "BOS+", style=label.style_label_up, color=color.new(color.teal, 0), textcolor=color.white, size=size.small)
+    if bearishCHoCH
+        label.new(bar_index, high, "CHoCH-", style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white, size=size.small)
+    if bearishBOS
+        label.new(bar_index, high, "BOS-", style=label.style_label_down, color=color.new(color.maroon, 0), textcolor=color.white, size=size.small)
+
+// ============================== ORDER BLOCKS ==============================
+var box   bullOB = na
+var box   bearOB = na
+var float bullOBTop = na
+var float bullOBBot = na
+var float bearOBTop = na
+var float bearOBBot = na
+var int   bullOBBar = na
+var int   bearOBBar = na
+var bool  bullOBTouched = false
+var bool  bearOBTouched = false
+
+findLastDownCandle() =>
+    float top = na
+    float bot = na
+    int foundBar = na
+    for i = 1 to obSearchBack
+        if close[i] < open[i]
+            top := high[i]
+            bot := low[i]
+            foundBar := bar_index - i
+            break
+    [top, bot, foundBar]
+
+findLastUpCandle() =>
+    float top = na
+    float bot = na
+    int foundBar = na
+    for i = 1 to obSearchBack
+        if close[i] > open[i]
+            top := high[i]
+            bot := low[i]
+            foundBar := bar_index - i
+            break
+    [top, bot, foundBar]
+
+if showOB and (bullishBOS or bullishCHoCH)
+    [t, b, fb] = findLastDownCandle()
+    if not na(t)
+        if not na(bullOB)
+            box.delete(bullOB)
+        bullOBTop := t
+        bullOBBot := b
+        bullOBBar := fb
+        bullOBTouched := false
+        bullOB := box.new(fb, t, bar_index + obMaxAge, b, border_color=color.teal, bgcolor=bullBoxColor)
+
+if showOB and (bearishBOS or bearishCHoCH)
+    [t, b, fb] = findLastUpCandle()
+    if not na(t)
+        if not na(bearOB)
+            box.delete(bearOB)
+        bearOBTop := t
+        bearOBBot := b
+        bearOBBar := fb
+        bearOBTouched := false
+        bearOB := box.new(fb, t, bar_index + obMaxAge, b, border_color=color.red, bgcolor=bearBoxColor)
+
+bullOBRetest = false
+bearOBRetest = false
+
+if not na(bullOB)
+    if low <= bullOBTop and low >= bullOBBot and bar_index > bullOBBar and not bullOBTouched
+        bullOBRetest := true
+        bullOBTouched := true
+    if close < bullOBBot
+        box.delete(bullOB)
+        bullOB := na
+
+if not na(bearOB)
+    if high >= bearOBBot and high <= bearOBTop and bar_index > bearOBBar and not bearOBTouched
+        bearOBRetest := true
+        bearOBTouched := true
+    if close > bearOBTop
+        box.delete(bearOB)
+        bearOB := na
+
+// ============================== FAIR VALUE GAPS ==============================
+bullFVG = showFVG and (low > high[2])
+bearFVG = showFVG and (high < low[2])
+
+if bullFVG
+    box.new(bar_index[2], high[2], bar_index + fvgMaxAge, low, border_color=color.blue, bgcolor=fvgBullColor)
+
+if bearFVG
+    box.new(bar_index[2], low[2], bar_index + fvgMaxAge, high, border_color=color.orange, bgcolor=fvgBearColor)
+
+// ============================== LIQUIDITY SWEEPS ==============================
+atrVal = ta.atr(atrLen)
+
+bullishSweep = showSweeps and not na(lastSwingLow) and low < lastSwingLow and close > lastSwingLow and (lastSwingLow - low) > minSweepATR * atrVal
+bearishSweep = showSweeps and not na(lastSwingHigh) and high > lastSwingHigh and close < lastSwingHigh and (high - lastSwingHigh) > minSweepATR * atrVal
+
+if bullishSweep
+    label.new(bar_index, low, "SWEEP", style=label.style_label_up, color=color.new(color.yellow, 0), textcolor=color.black, size=size.tiny)
+if bearishSweep
+    label.new(bar_index, high, "SWEEP", style=label.style_label_down, color=color.new(color.yellow, 0), textcolor=color.black, size=size.tiny)
+
+// ============================== PREMIUM / DISCOUNT ZONE ==============================
+var box eqZone = na
+
+if showZone and (not na(ph) or not na(pl))
+    if not na(lastSwingHigh) and not na(lastSwingLow)
+        if not na(eqZone)
+            box.delete(eqZone)
+        eqZone := box.new(bar_index - swingLen, lastSwingHigh, bar_index, lastSwingLow, border_color=color.new(color.gray, 70), bgcolor=color.new(color.gray, 92))
+else if showZone and not na(eqZone)
+    box.set_right(eqZone, bar_index)
+
+eqLevel = (not na(lastSwingHigh) and not na(lastSwingLow)) ? (lastSwingHigh + lastSwingLow) / 2 : na
+
+inDiscount = not na(eqLevel) and close < eqLevel
+inPremium  = not na(eqLevel) and close > eqLevel
+
+// ============================== COMPOSITE SETUPS ==============================
+longSetup  = (bullishCHoCH or bullishBOS or bullOBRetest) and inDiscount
+shortSetup = (bearishCHoCH or bearishBOS or bearOBRetest) and inPremium
+
+// ============================== ALERTS ==============================
+alertcondition(bullishCHoCH, "Bullish CHoCH", "{{ticker}} Bullish CHoCH on {{interval}} at {{close}}")
+alertcondition(bearishCHoCH, "Bearish CHoCH", "{{ticker}} Bearish CHoCH on {{interval}} at {{close}}")
+alertcondition(bullishBOS, "Bullish BOS", "{{ticker}} Bullish BOS on {{interval}} at {{close}}")
+alertcondition(bearishBOS, "Bearish BOS", "{{ticker}} Bearish BOS on {{interval}} at {{close}}")
+alertcondition(bullFVG, "Bullish FVG Formed", "{{ticker}} Bullish FVG formed on {{interval}}")
+alertcondition(bearFVG, "Bearish FVG Formed", "{{ticker}} Bearish FVG formed on {{interval}}")
+alertcondition(bullishSweep, "Bullish Liquidity Sweep", "{{ticker}} swept sell-side liquidity on {{interval}} at {{close}}")
+alertcondition(bearishSweep, "Bearish Liquidity Sweep", "{{ticker}} swept buy-side liquidity on {{interval}} at {{close}}")
+alertcondition(bullOBRetest, "Bullish OB Retest", "{{ticker}} retesting bullish order block on {{interval}} at {{close}}")
+alertcondition(bearOBRetest, "Bearish OB Retest", "{{ticker}} retesting bearish order block on {{interval}} at {{close}}")
+alertcondition(longSetup, "SMC Long Setup", "{{ticker}} potential LONG setup (structure shift + discount zone) on {{interval}} at {{close}}")
+alertcondition(shortSetup, "SMC Short Setup", "{{ticker}} potential SHORT setup (structure shift + premium zone) on {{interval}} at {{close}}")
