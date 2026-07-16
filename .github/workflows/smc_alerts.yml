@@ -1,4 +1,4 @@
-rts
+name: SMC Signal Alerts
 
 on:
   schedule:
@@ -13,6 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -25,17 +27,14 @@ jobs:
         env:
           TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ srets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python run_alerts.py
 
       - name: Commit updated state
         run: |
           git config user.name "smc-alert-bot"
           git config user.email "actions@users.noreply.github.com"
+          git pull origin main --rebase
           git add state.json
-          git diff --cached --quiet && exit 0
-          git stash
-          git pull --rebase origin main
-          git stash pop
-          git commit -m "Update signal state"
+          git diff --cached --quiet || git commit -m "Update signal state"
           git push
