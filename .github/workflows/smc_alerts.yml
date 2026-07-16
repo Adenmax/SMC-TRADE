@@ -8,13 +8,18 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: smc-alerts
+  cancel-in-progress: false
+
 jobs:
   check-signals:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          ref: main
+          fetch-depth: 1
 
       - uses: actions/setup-python@v5
         with:
@@ -30,11 +35,16 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python run_alerts.py
 
-      - name: Commit updated state
+      - name: Push updated state
         run: |
           git config user.name "smc-alert-bot"
           git config user.email "actions@users.noreply.github.com"
-          git pull origin main --rebase
           git add state.json
-          git diff --cached --quiet || git commit -m "Update signal state"
-          git push
+          if git diff --cached --quiet; then
+            echo "No state change, skipping commit"
+          else
+            git fetch origin main
+            git rebase origin/main
+            git commit -m "Update signal state"
+            git push origin main
+          fi
