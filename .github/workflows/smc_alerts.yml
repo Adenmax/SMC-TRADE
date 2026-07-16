@@ -1,5 +1,4 @@
 name: SMC Signal Alerts
-
 on:
   schedule:
     - cron: "*/15 * * * *"
