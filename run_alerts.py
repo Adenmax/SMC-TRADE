@@ -1,43 +1,28 @@
-import os
-import json
-import requests
-import pandas as pd
+"""
+run_alerts.py v2 — Kalisto FX 4-pillar framework
+Fetches 4 timeframes, runs full analysis, sends structured Telegram alert.
+API budget: daily + 4h + 1h + 15min = 4 calls x 2 symbols = 8 calls/run
+At 15-min schedule = ~768 calls/day (under Twelve Data free 800 limit).
+"""
 
-from smc_logic import compute_indicators
+import os, json, requests, pandas as pd
+from smc_logic import run_full_analysis
 
 TWELVE_DATA_API_KEY = os.environ["TWELVE_DATA_API_KEY"]
 TELEGRAM_BOT_TOKEN  = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID    = os.environ["TELEGRAM_CHAT_ID"]
+STATE_FILE          = "state.json"
 
-SYMBOLS = {
-    "XAU/USD": "Gold (XAU/USD)",
-    "GBP/JPY": "GBP/JPY",
-}
-
-INTERVAL   = os.environ.get("SMC_INTERVAL", "15min")
-STATE_FILE = "state.json"
-
-SIGNAL_MAP = {
-    "bullish_choch":  ("BUY",  "🟢", "CHoCH — Bearish structure broken, potential reversal UP"),
-    "bullish_bos":    ("BUY",  "🟢", "BOS — Bullish structure confirmed, uptrend continuation"),
-    "bull_fvg":       ("BUY",  "🔵", "Bullish Fair Value Gap formed (imbalance to fill UP)"),
-    "bullish_sweep":  ("BUY",  "🟡", "Sell-side liquidity swept — smart money may be buying"),
-    "bull_ob_retest": ("BUY",  "🟢", "Bullish Order Block retest — potential BUY zone"),
-    "long_setup":     ("BUY",  "✅", "LONG SETUP — Structure shift + price in discount zone"),
-    "bearish_choch":  ("SELL", "🔴", "CHoCH — Bullish structure broken, potential reversal DOWN"),
-    "bearish_bos":    ("SELL", "🔴", "BOS — Bearish structure confirmed, downtrend continuation"),
-    "bear_fvg":       ("SELL", "🟠", "Bearish Fair Value Gap formed (imbalance to fill DOWN)"),
-    "bearish_sweep":  ("SELL", "🟡", "Buy-side liquidity swept — smart money may be selling"),
-    "bear_ob_retest": ("SELL", "🔴", "Bearish Order Block retest — potential SELL zone"),
-    "short_setup":    ("SELL", "✅", "SHORT SETUP — Structure shift + price in premium zone"),
-}
+SYMBOLS = {"XAU/USD": "Gold (XAU/USD)", "GBP/JPY": "GBP/JPY"}
+TIMEFRAMES = ["1day", "4h", "1h", "15min"]
 
 
 def load_state():
-    if os.path.exists(STATE_FILE):
+    try:
         with open(STATE_FILE) as f:
             return json.load(f)
-    return {}
+    except Exception:
+        return {}
 
 
 def save_state(state):
@@ -45,19 +30,17 @@ def save_state(state):
         json.dump(state, f, indent=2)
 
 
-def fetch_bars(symbol, interval=INTERVAL, outputsize=150):
-    url    = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol":     symbol,
-        "interval":   interval,
-        "outputsize": outputsize,
-        "apikey":     TWELVE_DATA_API_KEY,
-        "order":      "ASC",
-    }
-    resp = requests.get(url, params=params, timeout=20)
+def fetch_bars(symbol, interval, outputsize=100):
+    resp = requests.get(
+        "https://api.twelvedata.com/time_series",
+        params={"symbol": symbol, "interval": interval,
+                "outputsize": outputsize, "apikey": TWELVE_DATA_API_KEY,
+                "order": "ASC"},
+        timeout=20,
+    )
     data = resp.json()
     if "values" not in data:
-        raise RuntimeError(f"Twelve Data error for {symbol}: {data}")
+        raise RuntimeError(f"Twelve Data error [{symbol} {interval}]: {data}")
     df = pd.DataFrame(data["values"])
     df["datetime"] = pd.to_datetime(df["datetime"])
     for col in ["open", "high", "low", "close"]:
@@ -66,52 +49,123 @@ def fetch_bars(symbol, interval=INTERVAL, outputsize=150):
 
 
 def send_telegram(text):
-    url  = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
+    resp = requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+        json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
+        timeout=10,
+    )
     if resp.status_code != 200:
-        print(f"Telegram send failed: {resp.text}")
+        print(f"Telegram error: {resp.text}")
 
 
-def build_message(symbol, label, bar_time, price, active_signals):
-    buy_signals  = [(k, v) for k, v in active_signals if v[0] == "BUY"]
-    sell_signals = [(k, v) for k, v in active_signals if v[0] == "SELL"]
+def bias_emoji(b):
+    return {"bullish": "🟢", "bearish": "🔴", "ranging": "⚪"}.get(b, "⚪")
 
-    if len(buy_signals) > len(sell_signals):
-        bias      = "🟢 BUY BIAS"
-        direction = "LOOK FOR LONGS"
-    elif len(sell_signals) > len(buy_signals):
-        bias      = "🔴 SELL BIAS"
-        direction = "LOOK FOR SHORTS"
-    else:
-        bias      = "⚪ MIXED SIGNALS"
-        direction = "WAIT FOR CONFIRMATION"
+
+def build_message(symbol, label, price, bar_time, r):
+    a  = r["alignment"]
+    b  = r["bias"]
+    n  = r["narrative"]
+    p  = r["poi"]
+    c  = r["confirmation"]
+    t  = r["trade_idea"]
+
+    kz   = n.get("kill_zone") or "Outside kill zone"
+    ls   = n.get("london_sweep")
+    fvgm = n.get("fvg_momentum")
 
     lines = [
-        f"<b>📡 SMC ALERT — {label}</b>",
-        f"<b>Direction: {bias}</b>",
-        f"<b>Action: {direction}</b>",
-        f"Price: {price:.5f}",
-        f"Time: {bar_time} ({INTERVAL})",
+        f"<b>📡 SMC ALERT v2 — {label}</b>",
+        f"Price: <b>{price:.5f}</b>  |  {bar_time}",
         "",
+        f"<b>【 PILLAR 1 — BIAS 】</b>",
+        f"  Daily  {bias_emoji(b.get('daily'))}  {b.get('daily','?').upper()}",
+        f"  4H     {bias_emoji(b.get('4h'))}  {b.get('4h','?').upper()}",
+        f"  1H     {bias_emoji(b.get('1h'))}  {b.get('1h','?').upper()}",
+        f"  15min  {bias_emoji(b.get('15min'))}  {b.get('15min','?').upper()}",
+        f"  → <b>{a['label']}</b>  ({a['score']}/4 aligned)",
+        "",
+        f"<b>【 PILLAR 2 — NARRATIVE 】</b>",
+        f"  Kill zone: <b>{kz}</b>",
     ]
 
-    if buy_signals:
-        lines.append("🟢 <b>Bullish Signals:</b>")
-        for _, (_, emoji, desc) in buy_signals:
-            lines.append(f"  {emoji} {desc}")
+    if ls == "swept_high":
+        lines.append("  🟡 London swept Asian HIGH → expect move DOWN")
+    elif ls == "swept_low":
+        lines.append("  🟡 London swept Asian LOW → expect move UP")
 
-    if sell_signals:
-        if buy_signals:
-            lines.append("")
-        lines.append("🔴 <b>Bearish Signals:</b>")
-        for _, (_, emoji, desc) in sell_signals:
-            lines.append(f"  {emoji} {desc}")
+    if fvgm:
+        lines.append(f"  📊 {fvgm}")
 
-    lines += [
-        "",
-        "⚠️ Always confirm on chart before entering.",
-    ]
+    lines += ["", f"<b>【 PILLAR 3 — POINTS OF INTEREST 】</b>"]
 
+    bull_ob = p.get("bull_ob_1h")
+    bear_ob = p.get("bear_ob_1h")
+    bull_fvg = p.get("bull_fvg_1h")
+    bear_fvg = p.get("bear_fvg_1h")
+    ph = p.get("prev_session_high")
+    pl = p.get("prev_session_low")
+
+    if bull_ob:
+        lines.append(f"  🟢 Bullish OB (1H): {bull_ob['bot']:.5f} – {bull_ob['top']:.5f}")
+    if bull_fvg:
+        lines.append(f"  🔵 Bullish FVG (1H): {bull_fvg['bot']:.5f} – {bull_fvg['top']:.5f}")
+    if bear_ob:
+        lines.append(f"  🔴 Bearish OB (1H): {bear_ob['bot']:.5f} – {bear_ob['top']:.5f}")
+    if bear_fvg:
+        lines.append(f"  🟠 Bearish FVG (1H): {bear_fvg['bot']:.5f} – {bear_fvg['top']:.5f}")
+    if ph:
+        lines.append(f"  📌 Prev session high: {ph:.5f}  (BSL target)")
+    if pl:
+        lines.append(f"  📌 Prev session low:  {pl:.5f}  (SSL target)")
+
+    eq = p.get("equal_levels_4h", [])
+    for lvl in eq[:2]:
+        tag = "Equal Highs (BSL)" if lvl["type"] == "eq_high" else "Equal Lows (SSL)"
+        lines.append(f"  ⚡ {tag}: {lvl['level']:.5f}  ({lvl['count']}x touched)")
+
+    lines += ["", f"<b>【 PILLAR 4 — CONFIRMATION 】</b>"]
+
+    sc15 = c.get("sweep_choch_15min")
+    sc1h = c.get("sweep_choch_1h")
+    eng  = c.get("engulfing_15min")
+    bf15 = c.get("bull_fvg_15min")
+    brf15 = c.get("bear_fvg_15min")
+
+    if sc15 == "bullish_reversal":
+        lines.append("  ✅ Sweep + CHoCH (15min) → BULLISH REVERSAL confirmed")
+    if sc15 == "bearish_reversal":
+        lines.append("  ✅ Sweep + CHoCH (15min) → BEARISH REVERSAL confirmed")
+    if sc1h == "bullish_reversal":
+        lines.append("  ✅ Sweep + CHoCH (1H) → BULLISH REVERSAL confirmed")
+    if sc1h == "bearish_reversal":
+        lines.append("  ✅ Sweep + CHoCH (1H) → BEARISH REVERSAL confirmed")
+    if eng == "bullish_engulfing":
+        lines.append("  📗 Bullish engulfing candle (15min)")
+    if eng == "bearish_engulfing":
+        lines.append("  📕 Bearish engulfing candle (15min)")
+    if bf15:
+        lines.append(f"  🔵 LTF Bull FVG (15min): {bf15['bot']:.5f} – {bf15['top']:.5f}")
+    if brf15:
+        lines.append(f"  🟠 LTF Bear FVG (15min): {brf15['bot']:.5f} – {brf15['top']:.5f}")
+
+    if not any([sc15, sc1h, eng, bf15, brf15]):
+        lines.append("  ⏳ No confirmation yet — wait for entry trigger")
+
+    lines += ["", "─" * 30]
+
+    if t["signal"]:
+        emoji = "🟢 BUY" if t["signal"] == "BUY" else "🔴 SELL"
+        lines += [
+            f"<b>🎯 TRADE IDEA: {emoji}</b>",
+            f"  Quality:  <b>{t['quality']}</b>",
+            f"  SL:       {t['sl_note']}",
+            f"  TP:       {t['tp_note']}",
+        ]
+    else:
+        lines.append("<b>⏸ NO TRADE — conditions not met yet. Wait for all 4 pillars.</b>")
+
+    lines += ["", "⚠️ Always confirm on chart. Never trade without all 4 pillars."]
     return "\n".join(lines)
 
 
@@ -120,40 +174,49 @@ def main():
 
     for symbol, label in SYMBOLS.items():
         try:
-            df = fetch_bars(symbol)
+            dfs = {}
+            for tf in TIMEFRAMES:
+                dfs[tf] = fetch_bars(symbol, tf, outputsize=100)
         except Exception as exc:
-            print(f"Failed to fetch {symbol}: {exc}")
+            print(f"Fetch error [{symbol}]: {exc}")
             continue
 
-        if len(df) < 30:
-            print(f"Not enough bars for {symbol}, skipping")
+        df_15min = dfs.get("15min")
+        if df_15min is None or len(df_15min) < 20:
+            print(f"Not enough 15min bars for {symbol}")
             continue
 
-        df = compute_indicators(df)
-
-        idx      = len(df) - 2
-        bar_time = df.loc[idx, "datetime"].isoformat()
-        last_seen = state.get(symbol, {}).get("last_processed_time")
-
+        bar_time  = df_15min["datetime"].iloc[-2].isoformat()
+        last_seen = state.get(symbol, {}).get("last_bar")
         if last_seen == bar_time:
-            print(f"No new bar for {symbol}, skipping")
+            print(f"No new bar for {symbol}")
             continue
 
-        active = [
-            (k, SIGNAL_MAP[k])
-            for k in SIGNAL_MAP
-            if bool(df.loc[idx, k])
-        ]
+        r = run_full_analysis(
+            df_daily  = dfs.get("1day"),
+            df_4h     = dfs.get("4h"),
+            df_1h     = dfs.get("1h"),
+            df_15min  = df_15min,
+        )
 
-        if active:
-            price = df.loc[idx, "close"]
-            msg   = build_message(symbol, label, bar_time, price, active)
+        # Only send if there's a trade idea OR a sweep+CHoCH confirmation
+        conf = r["confirmation"]
+        has_signal = (
+            r["trade_idea"]["signal"] is not None
+            or conf.get("sweep_choch_15min") is not None
+            or conf.get("sweep_choch_1h") is not None
+            or conf.get("engulfing_15min") is not None
+        )
+
+        if has_signal:
+            price = df_15min["close"].iloc[-2]
+            msg = build_message(symbol, label, price, bar_time, r)
             send_telegram(msg)
             print(f"Alert sent for {symbol} at {bar_time}")
         else:
-            print(f"No new signal for {symbol} at {bar_time}")
+            print(f"No signal for {symbol} at {bar_time}")
 
-        state.setdefault(symbol, {})["last_processed_time"] = bar_time
+        state.setdefault(symbol, {})["last_bar"] = bar_time
 
     save_state(state)
 
