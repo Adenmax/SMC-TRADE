@@ -1,209 +1,376 @@
 """
-SMC signal detection logic (Python port of the SMC_Signals.pine indicator).
+SMC Logic v2 — built 100% from the Kalisto FX framework:
+  Bias → Narrative → POI → Confirmation
 
-Given a DataFrame with columns: datetime, open, high, low, close (ascending
-order, oldest first), compute_indicators() returns the same DataFrame with
-extra boolean columns marking SMC events on each bar:
-
-    bullish_choch, bullish_bos, bearish_choch, bearish_bos
-    bull_fvg, bear_fvg
-    bullish_sweep, bearish_sweep
-    bull_ob_retest, bear_ob_retest
-    long_setup, short_setup
+Pillars implemented:
+  1. BIAS      — top-down structural bias (Daily/4H/1H/15min)
+  2. NARRATIVE — kill zone, London/Asian sweep, FVG momentum
+  3. POI       — order blocks, FVGs (candle-3 rule), session liquidity, equal H/L
+  4. CONFIRM   — sweep + CHoCH (highest probability), engulfing, LTF FVG
 """
 
 import numpy as np
 import pandas as pd
+from datetime import datetime, timezone
 
 
-def _find_pivots(high, low, swing_len):
-    n = len(high)
-    pivot_high = [False] * n
-    pivot_low = [False] * n
-    for i in range(swing_len, n - swing_len):
-        window_h = high[i - swing_len : i + swing_len + 1]
-        if high[i] == window_h.max():
-            pivot_high[i] = True
-        window_l = low[i - swing_len : i + swing_len + 1]
-        if low[i] == window_l.min():
-            pivot_low[i] = True
-    return pivot_high, pivot_low
+def _swing_points(high, low, n=5):
+    size = len(high)
+    ph = [False] * size
+    pl = [False] * size
+    for i in range(n, size - n):
+        if high[i] == max(high[i - n: i + n + 1]):
+            ph[i] = True
+        if low[i] == min(low[i - n: i + n + 1]):
+            pl[i] = True
+    return ph, pl
 
 
-def _atr(high, low, close, length):
-    n = len(high)
-    tr = np.zeros(n)
-    for i in range(1, n):
-        tr[i] = max(
-            high[i] - low[i],
-            abs(high[i] - close[i - 1]),
-            abs(low[i] - close[i - 1]),
-        )
+def _atr(high, low, close, length=14):
+    tr = [0.0] * len(high)
+    for i in range(1, len(high)):
+        tr[i] = max(high[i] - low[i],
+                    abs(high[i] - close[i - 1]),
+                    abs(low[i] - close[i - 1]))
     return pd.Series(tr).rolling(length, min_periods=1).mean().values
 
 
-def compute_indicators(
-    df,
-    swing_len=5,
-    ob_search_back=15,
-    ob_max_age=80,
-    atr_len=14,
-    min_sweep_atr=0.15,
-):
-    df = df.copy().reset_index(drop=True)
-    n = len(df)
+# ── PILLAR 1: BIAS ────────────────────────────────────────────────────────────
+def get_bias(df, swing_n=5):
+    h = df["high"].values
+    l = df["low"].values
+    ph, pl = _swing_points(h, l, swing_n)
+    swing_highs = [(i, h[i]) for i in range(len(h)) if ph[i]]
+    swing_lows  = [(i, l[i]) for i in range(len(l)) if pl[i]]
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        return "ranging"
+    hh = swing_highs[-1][1] > swing_highs[-2][1]
+    hl = swing_lows[-1][1]  > swing_lows[-2][1]
+    ll = swing_lows[-1][1]  < swing_lows[-2][1]
+    lh = swing_highs[-1][1] < swing_highs[-2][1]
+    if hh and hl:
+        return "bullish"
+    if ll and lh:
+        return "bearish"
+    return "ranging"
 
-    high = df["high"].values
-    low = df["low"].values
-    close = df["close"].values
-    open_ = df["open"].values
 
-    pivot_high, pivot_low = _find_pivots(high, low, swing_len)
-    atr = _atr(high, low, close, atr_len)
+def get_alignment_score(biases: dict):
+    bull = sum(1 for v in biases.values() if v == "bullish")
+    bear = sum(1 for v in biases.values() if v == "bearish")
+    total = len(biases)
+    if bull > bear:
+        direction, score = "bullish", bull
+    elif bear > bull:
+        direction, score = "bearish", bear
+    else:
+        direction, score = "ranging", 0
+    if score == total:
+        label = "VERY STRONG TREND"
+    elif score == total - 1:
+        label = "STRONG TREND"
+    elif score == total - 2:
+        label = "RANGING — wait for clarity"
+    else:
+        label = "NO CLEAR BIAS — sit out"
+    return direction, score, label
 
-    last_swing_high = np.nan
-    last_swing_low = np.nan
-    trend = 0  # 1 bullish structure, -1 bearish structure, 0 unknown
 
-    bull_ob = None  # dict: top, bot, bar, touched
-    bear_ob = None
+# ── PILLAR 2: NARRATIVE ───────────────────────────────────────────────────────
+KILL_ZONES = {
+    "Asian":  (20, 24),
+    "London": (2,  5),
+    "NY AM":  (8,  12),
+    "NY PM":  (13, 17),
+}
 
-    cols = [
-        "bullish_choch", "bullish_bos", "bearish_choch", "bearish_bos",
-        "bull_fvg", "bear_fvg", "bullish_sweep", "bearish_sweep",
-        "bull_ob_retest", "bear_ob_retest", "long_setup", "short_setup",
-    ]
-    results = {c: [False] * n for c in cols}
 
-    for j in range(n):
-        # A pivot at index (j - swing_len) only becomes "known" swing_len
-        # bars later, same lag as ta.pivothigh/pivotlow in Pine.
-        confirm_idx = j - swing_len
-        if confirm_idx >= 0:
-            if pivot_high[confirm_idx]:
-                last_swing_high = high[confirm_idx]
-            if pivot_low[confirm_idx]:
-                last_swing_low = low[confirm_idx]
+def get_kill_zone(dt: datetime):
+    hour_et = (dt.hour - 4) % 24
+    for name, (start, end) in KILL_ZONES.items():
+        if start <= hour_et < end:
+            return name
+    return None
 
-        bull_break = (
-            j > 0
-            and not np.isnan(last_swing_high)
-            and close[j] > last_swing_high
-            and close[j - 1] <= last_swing_high
-        )
-        bear_break = (
-            j > 0
-            and not np.isnan(last_swing_low)
-            and close[j] < last_swing_low
-            and close[j - 1] >= last_swing_low
-        )
 
-        bullish_choch = bullish_bos = bearish_choch = bearish_bos = False
+def detect_consecutive_fvg(df, direction="bullish", lookback=6):
+    h = df["high"].values
+    l = df["low"].values
+    count = 0
+    for i in range(max(2, len(df) - lookback), len(df)):
+        if direction == "bullish" and l[i] > h[i - 2]:
+            count += 1
+        elif direction == "bearish" and h[i] < l[i - 2]:
+            count += 1
+    return count >= 2
+
+
+def detect_fvg_momentum_fading(df, direction="bearish", lookback=8):
+    h = df["high"].values
+    l = df["low"].values
+    for i in range(max(2, len(df) - lookback), len(df)):
+        if direction == "bullish" and l[i] > h[i - 2]:
+            return False
+        if direction == "bearish" and h[i] < l[i - 2]:
+            return False
+    return True
+
+
+def detect_london_asian_sweep(df_asian, df_london):
+    if df_asian is None or df_london is None:
+        return None
+    if len(df_asian) == 0 or len(df_london) == 0:
+        return None
+    asian_high = df_asian["high"].max()
+    asian_low  = df_asian["low"].min()
+    london_high = df_london["high"].max()
+    london_low  = df_london["low"].min()
+    london_close = df_london["close"].iloc[-1]
+    if london_high > asian_high and london_close < asian_high:
+        return "swept_high"
+    if london_low < asian_low and london_close > asian_low:
+        return "swept_low"
+    return None
+
+
+# ── PILLAR 3: POI ─────────────────────────────────────────────────────────────
+def get_fvg(df, direction="bullish", candle3_rule=True):
+    h = df["high"].values
+    l = df["low"].values
+    c = df["close"].values
+    fvgs = []
+    for i in range(2, len(df)):
+        if direction == "bullish" and l[i] > h[i - 2]:
+            valid = (not candle3_rule) or (c[i] <= h[i - 1])
+            fvgs.append({"top": l[i], "bot": h[i - 2], "bar": i,
+                         "valid": valid, "direction": "bullish"})
+        elif direction == "bearish" and h[i] < l[i - 2]:
+            valid = (not candle3_rule) or (c[i] >= l[i - 1])
+            fvgs.append({"top": l[i - 2], "bot": h[i], "bar": i,
+                         "valid": valid, "direction": "bearish"})
+    return fvgs
+
+
+def get_order_blocks(df, swing_n=5, search_back=15):
+    h = df["high"].values
+    l = df["low"].values
+    o = df["open"].values
+    c = df["close"].values
+    ph, pl = _swing_points(h, l, swing_n)
+    last_sh = last_sl = None
+    bull_ob = bear_ob = None
+    for j in range(len(df)):
+        ci = j - swing_n
+        if ci >= 0:
+            if ph[ci]: last_sh = h[ci]
+            if pl[ci]: last_sl = l[ci]
+        bull_break = (last_sh is not None and j > 0
+                      and c[j] > last_sh and c[j-1] <= last_sh)
+        bear_break = (last_sl is not None and j > 0
+                      and c[j] < last_sl and c[j-1] >= last_sl)
         if bull_break:
-            if trend <= 0:
-                bullish_choch = True
-            else:
-                bullish_bos = True
-            trend = 1
+            for k in range(j-1, max(j-search_back, -1), -1):
+                if c[k] < o[k]:
+                    bull_ob = {"top": h[k], "bot": l[k], "bar": k}
+                    break
         if bear_break:
-            if trend >= 0:
-                bearish_choch = True
-            else:
-                bearish_bos = True
-            trend = -1
-
-        results["bullish_choch"][j] = bullish_choch
-        results["bullish_bos"][j] = bullish_bos
-        results["bearish_choch"][j] = bearish_choch
-        results["bearish_bos"][j] = bearish_bos
-
-        # ---- Order blocks ----
-        if bullish_bos or bullish_choch:
-            top = bot = fb = None
-            for k in range(j - 1, max(j - 1 - ob_search_back, -1), -1):
-                if close[k] < open_[k]:
-                    top, bot, fb = high[k], low[k], k
+            for k in range(j-1, max(j-search_back, -1), -1):
+                if c[k] > o[k]:
+                    bear_ob = {"top": h[k], "bot": l[k], "bar": k}
                     break
-            if top is not None:
-                bull_ob = {"top": top, "bot": bot, "bar": fb, "touched": False}
+    return bull_ob, bear_ob
 
-        if bearish_bos or bearish_choch:
-            top = bot = fb = None
-            for k in range(j - 1, max(j - 1 - ob_search_back, -1), -1):
-                if close[k] > open_[k]:
-                    top, bot, fb = high[k], low[k], k
+
+def get_equal_highs_lows(df, tolerance=0.001, lookback=30):
+    h = df["high"].values[-lookback:]
+    l = df["low"].values[-lookback:]
+    pools = []
+    seen_h = set()
+    for i in range(len(h)):
+        if i in seen_h:
+            continue
+        cluster = [i]
+        for j in range(i+1, len(h)):
+            if abs(h[j] - h[i]) / h[i] < tolerance:
+                cluster.append(j)
+                seen_h.add(j)
+        if len(cluster) >= 2:
+            pools.append({"level": float(np.mean([h[k] for k in cluster])),
+                          "type": "eq_high", "count": len(cluster)})
+    seen_l = set()
+    for i in range(len(l)):
+        if i in seen_l:
+            continue
+        cluster = [i]
+        for j in range(i+1, len(l)):
+            if abs(l[j] - l[i]) / l[i] < tolerance:
+                cluster.append(j)
+                seen_l.add(j)
+        if len(cluster) >= 2:
+            pools.append({"level": float(np.mean([l[k] for k in cluster])),
+                          "type": "eq_low", "count": len(cluster)})
+    return pools
+
+
+def get_session_levels(df):
+    if "datetime" not in df.columns:
+        return None, None
+    df2 = df.copy()
+    df2["date"] = df2["datetime"].dt.date
+    grouped = df2.groupby("date")
+    dates = sorted(grouped.groups.keys())
+    if len(dates) < 2:
+        return None, None
+    prev = grouped.get_group(dates[-2])
+    return float(prev["high"].max()), float(prev["low"].min())
+
+
+# ── PILLAR 4: CONFIRMATION ────────────────────────────────────────────────────
+def detect_sweep_choch(df, swing_n=5, min_atr_wick=0.1):
+    h = df["high"].values
+    l = df["low"].values
+    c = df["close"].values
+    atr = _atr(h, l, c)
+    ph, pl = _swing_points(h, l, swing_n)
+    last_sh = last_sl = None
+    result = None
+    for j in range(len(df)):
+        ci = j - swing_n
+        if ci >= 0:
+            if ph[ci]: last_sh = h[ci]
+            if pl[ci]: last_sl = l[ci]
+        if last_sh is None or last_sl is None:
+            continue
+        bear_sweep = (h[j] > last_sh and c[j] < last_sh
+                      and (h[j] - last_sh) > min_atr_wick * atr[j])
+        if bear_sweep:
+            for k in range(j+1, min(j+6, len(df))):
+                if c[k-1] > last_sl and c[k] < last_sl:
+                    result = "bearish_reversal"
                     break
-            if top is not None:
-                bear_ob = {"top": top, "bot": bot, "bar": fb, "touched": False}
+        bull_sweep = (l[j] < last_sl and c[j] > last_sl
+                      and (last_sl - l[j]) > min_atr_wick * atr[j])
+        if bull_sweep:
+            for k in range(j+1, min(j+6, len(df))):
+                if c[k-1] < last_sh and c[k] > last_sh:
+                    result = "bullish_reversal"
+                    break
+    return result
 
-        bull_ob_retest = False
-        if bull_ob is not None:
-            if (
-                low[j] <= bull_ob["top"]
-                and low[j] >= bull_ob["bot"]
-                and j > bull_ob["bar"]
-                and not bull_ob["touched"]
-            ):
-                bull_ob_retest = True
-                bull_ob["touched"] = True
-            if close[j] < bull_ob["bot"] or (j - bull_ob["bar"]) > ob_max_age:
-                bull_ob = None
 
-        bear_ob_retest = False
-        if bear_ob is not None:
-            if (
-                high[j] >= bear_ob["bot"]
-                and high[j] <= bear_ob["top"]
-                and j > bear_ob["bar"]
-                and not bear_ob["touched"]
-            ):
-                bear_ob_retest = True
-                bear_ob["touched"] = True
-            if close[j] > bear_ob["top"] or (j - bear_ob["bar"]) > ob_max_age:
-                bear_ob = None
+def detect_engulfing(df):
+    if len(df) < 3:
+        return None
+    idx = len(df) - 2
+    o = df["open"].values
+    c = df["close"].values
+    if (c[idx] < o[idx] and c[idx-1] > o[idx-1]
+            and o[idx] >= c[idx-1] and c[idx] <= o[idx-1]):
+        return "bearish_engulfing"
+    if (c[idx] > o[idx] and c[idx-1] < o[idx-1]
+            and o[idx] <= c[idx-1] and c[idx] >= o[idx-1]):
+        return "bullish_engulfing"
+    return None
 
-        results["bull_ob_retest"][j] = bull_ob_retest
-        results["bear_ob_retest"][j] = bear_ob_retest
 
-        # ---- Fair value gaps (3-bar imbalance) ----
-        bull_fvg = j >= 2 and low[j] > high[j - 2]
-        bear_fvg = j >= 2 and high[j] < low[j - 2]
-        results["bull_fvg"][j] = bull_fvg
-        results["bear_fvg"][j] = bear_fvg
+# ── MASTER ANALYSIS ───────────────────────────────────────────────────────────
+def run_full_analysis(df_daily, df_4h, df_1h, df_15min,
+                      df_asian=None, df_london=None):
+    result = {"bias": {}, "alignment": {}, "narrative": {},
+              "poi": {}, "confirmation": {}, "trade_idea": {}}
 
-        # ---- Liquidity sweeps ----
-        bullish_sweep = (
-            not np.isnan(last_swing_low)
-            and not np.isnan(atr[j])
-            and low[j] < last_swing_low
-            and close[j] > last_swing_low
-            and (last_swing_low - low[j]) > min_sweep_atr * atr[j]
-        )
-        bearish_sweep = (
-            not np.isnan(last_swing_high)
-            and not np.isnan(atr[j])
-            and high[j] > last_swing_high
-            and close[j] < last_swing_high
-            and (high[j] - last_swing_high) > min_sweep_atr * atr[j]
-        )
-        results["bullish_sweep"][j] = bullish_sweep
-        results["bearish_sweep"][j] = bearish_sweep
+    # Pillar 1
+    biases = {}
+    for label, df in [("daily", df_daily), ("4h", df_4h),
+                      ("1h", df_1h), ("15min", df_15min)]:
+        biases[label] = get_bias(df) if (df is not None and len(df) >= 20) else "ranging"
+    result["bias"] = biases
+    direction, score, align_label = get_alignment_score(biases)
+    result["alignment"] = {"direction": direction, "score": score, "label": align_label}
 
-        # ---- Premium / discount zone ----
-        eq_level = np.nan
-        if not np.isnan(last_swing_high) and not np.isnan(last_swing_low):
-            eq_level = (last_swing_high + last_swing_low) / 2
-        in_discount = not np.isnan(eq_level) and close[j] < eq_level
-        in_premium = not np.isnan(eq_level) and close[j] > eq_level
+    # Pillar 2
+    kz = None
+    if df_15min is not None and "datetime" in df_15min.columns and len(df_15min) >= 2:
+        last_dt = df_15min["datetime"].iloc[-2]
+        if hasattr(last_dt, "to_pydatetime"):
+            last_dt = last_dt.to_pydatetime()
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=timezone.utc)
+        kz = get_kill_zone(last_dt)
 
-        results["long_setup"][j] = (
-            bullish_choch or bullish_bos or bull_ob_retest
-        ) and in_discount
-        results["short_setup"][j] = (
-            bearish_choch or bearish_bos or bear_ob_retest
-        ) and in_premium
+    london_asian = detect_london_asian_sweep(df_asian, df_london)
 
-    for c in cols:
-        df[c] = results[c]
+    fvg_momentum = None
+    if df_1h is not None and len(df_1h) >= 10:
+        if detect_consecutive_fvg(df_1h, direction):
+            fvg_momentum = f"Consecutive {direction} FVGs — momentum strong"
+        elif detect_fvg_momentum_fading(df_1h, direction):
+            fvg_momentum = f"{direction.title()} FVG momentum fading — possible reversal"
 
-    return df
+    result["narrative"] = {"kill_zone": kz, "london_sweep": london_asian,
+                           "fvg_momentum": fvg_momentum}
+
+    # Pillar 3
+    poi = {}
+    if df_1h is not None and len(df_1h) >= 20:
+        bull_ob, bear_ob = get_order_blocks(df_1h)
+        poi["bull_ob_1h"] = bull_ob
+        poi["bear_ob_1h"] = bear_ob
+    if df_1h is not None and len(df_1h) >= 10:
+        bf = get_fvg(df_1h, "bullish", candle3_rule=True)
+        brf = get_fvg(df_1h, "bearish", candle3_rule=True)
+        poi["bull_fvg_1h"] = next((f for f in reversed(bf) if f["valid"]), None)
+        poi["bear_fvg_1h"] = next((f for f in reversed(brf) if f["valid"]), None)
+    if df_4h is not None and len(df_4h) >= 15:
+        poi["equal_levels_4h"] = get_equal_highs_lows(df_4h)
+    else:
+        poi["equal_levels_4h"] = []
+    if df_1h is not None and len(df_1h) >= 2:
+        ph, pl = get_session_levels(df_1h)
+        poi["prev_session_high"] = ph
+        poi["prev_session_low"]  = pl
+    result["poi"] = poi
+
+    # Pillar 4
+    conf = {}
+    if df_15min is not None and len(df_15min) >= 15:
+        conf["sweep_choch_15min"] = detect_sweep_choch(df_15min)
+    if df_1h is not None and len(df_1h) >= 15:
+        conf["sweep_choch_1h"] = detect_sweep_choch(df_1h)
+    if df_15min is not None and len(df_15min) >= 3:
+        conf["engulfing_15min"] = detect_engulfing(df_15min)
+    if df_15min is not None and len(df_15min) >= 5:
+        bf15 = get_fvg(df_15min, "bullish", candle3_rule=True)
+        brf15 = get_fvg(df_15min, "bearish", candle3_rule=True)
+        conf["bull_fvg_15min"] = next((f for f in reversed(bf15) if f["valid"]), None)
+        conf["bear_fvg_15min"] = next((f for f in reversed(brf15) if f["valid"]), None)
+    result["confirmation"] = conf
+
+    # Trade idea
+    trade = {"signal": None, "quality": None, "sl_note": None, "tp_note": None}
+    if score >= 3 and direction != "ranging":
+        sc15 = conf.get("sweep_choch_15min")
+        sc1h = conf.get("sweep_choch_1h")
+        eng  = conf.get("engulfing_15min")
+        bull_conf = (sc15 == "bullish_reversal" or sc1h == "bullish_reversal"
+                     or eng == "bullish_engulfing"
+                     or conf.get("bull_fvg_15min") is not None)
+        bear_conf = (sc15 == "bearish_reversal" or sc1h == "bearish_reversal"
+                     or eng == "bearish_engulfing"
+                     or conf.get("bear_fvg_15min") is not None)
+        if direction == "bullish" and bull_conf:
+            ob  = poi.get("bull_ob_1h")
+            fvg = poi.get("bull_fvg_1h")
+            trade.update({"signal": "BUY",
+                          "quality": "HIGH ✅" if (ob and fvg) else "MEDIUM ⚠️",
+                          "sl_note": "Below 1H bullish OB / FVG low",
+                          "tp_note": "Prev session high / equal highs (BSL)"})
+        elif direction == "bearish" and bear_conf:
+            ob  = poi.get("bear_ob_1h")
+            fvg = poi.get("bear_fvg_1h")
+            trade.update({"signal": "SELL",
+                          "quality": "HIGH ✅" if (ob and fvg) else "MEDIUM ⚠️",
+                          "sl_note": "Above 1H bearish OB / FVG high",
+                          "tp_note": "Prev session low / equal lows (SSL)"})
+    result["trade_idea"] = trade
+    return result
