@@ -1,9 +1,12 @@
-name: SMC Signal Alerts
+name: SMC Signal Alerts v2
 
 on:
   schedule:
     - cron: "*/15 * * * *"
   workflow_dispatch: {}
+
+permissions:
+  contents: write
 
 concurrency:
   group: smc-alerts
