@@ -1,12 +1,14 @@
-import os, json, requests, pandas as pd
+import os
+import json
+import requests
+import pandas as pd
 from smc_logic import run_full_analysis
 
 TWELVE_DATA_API_KEY = os.environ["TWELVE_DATA_API_KEY"]
-TELEGRAM_BOT_TOKEN  = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID    = os.environ["TELEGRAM_CHAT_ID"]
-STATE_FILE          = "state.json"
-
-SYMBOLS    = {"XAU/USD": "Gold (XAU/USD)", "GBP/JPY": "GBP/JPY"}
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+STATE_FILE = "state.json"
+SYMBOLS = {"XAU/USD": "Gold (XAU/USD)", "GBP/JPY": "GBP/JPY"}
 TIMEFRAMES = ["1day", "4h", "1h", "15min"]
 
 
@@ -26,9 +28,13 @@ def save_state(state):
 def fetch_bars(symbol, interval, outputsize=100):
     resp = requests.get(
         "https://api.twelvedata.com/time_series",
-        params={"symbol": symbol, "interval": interval,
-                "outputsize": outputsize, "apikey": TWELVE_DATA_API_KEY,
-                "order": "ASC"},
+        params={
+            "symbol": symbol,
+            "interval": interval,
+            "outputsize": outputsize,
+            "apikey": TWELVE_DATA_API_KEY,
+            "order": "ASC",
+        },
         timeout=20,
     )
     data = resp.json()
@@ -52,7 +58,11 @@ def send_telegram(text):
 
 
 def bias_emoji(b):
-    return {"bullish": "🟢", "bearish": "🔴", "ranging": "⚪"}.get(b, "⚪")
+    if b == "bullish":
+        return "🟢"
+    if b == "bearish":
+        return "🔴"
+    return "⚪"
 
 
 def get_entry_levels(signal, poi, conf):
@@ -60,49 +70,49 @@ def get_entry_levels(signal, poi, conf):
     sl = None
     tp1 = None
     tp2 = None
-    buffer_pct = 0.0003
+    buf = 0.0003
 
     if signal == "BUY":
-        fvg15 = conf.get("bull_fvg_15min")
-        fvg1h = poi.get("bull_fvg_1h")
+        f15 = conf.get("bull_fvg_15min")
+        f1h = poi.get("bull_fvg_1h")
         ob = poi.get("bull_ob_1h")
-        if fvg15:
-            entry = fvg15["top"]
-            sl = fvg15["bot"] * (1 - buffer_pct)
-        elif fvg1h:
-            entry = fvg1h["top"]
-            sl = fvg1h["bot"] * (1 - buffer_pct)
-        elif ob:
+        if f15 is not None:
+            entry = f15["top"]
+            sl = f15["bot"] * (1 - buf)
+        elif f1h is not None:
+            entry = f1h["top"]
+            sl = f1h["bot"] * (1 - buf)
+        elif ob is not None:
             entry = (ob["top"] + ob["bot"]) / 2
-            sl = ob["bot"] * (1 - buffer_pct)
+            sl = ob["bot"] * (1 - buf)
         tp1 = poi.get("prev_session_high")
         eq = [e for e in poi.get("equal_levels_4h", []) if e["type"] == "eq_high"]
         tp2 = eq[0]["level"] if eq else None
 
-    elif signal == "SELL":
-        fvg15 = conf.get("bear_fvg_15min")
-        fvg1h = poi.get("bear_fvg_1h")
+    if signal == "SELL":
+        f15 = conf.get("bear_fvg_15min")
+        f1h = poi.get("bear_fvg_1h")
         ob = poi.get("bear_ob_1h")
-        if fvg15:
-            entry = fvg15["bot"]
-            sl = fvg15["top"] * (1 + buffer_pct)
-        elif fvg1h:
-            entry = fvg1h["bot"]
-            sl = fvg1h["top"] * (1 + buffer_pct)
-        elif ob:
+        if f15 is not None:
+            entry = f15["bot"]
+            sl = f15["top"] * (1 + buf)
+        elif f1h is not None:
+            entry = f1h["bot"]
+            sl = f1h["top"] * (1 + buf)
+        elif ob is not None:
             entry = (ob["top"] + ob["bot"]) / 2
-            sl = ob["top"] * (1 + buffer_pct)
+            sl = ob["top"] * (1 + buf)
         tp1 = poi.get("prev_session_low")
         eq = [e for e in poi.get("equal_levels_4h", []) if e["type"] == "eq_low"]
         tp2 = eq[0]["level"] if eq else None
 
     rr1 = None
     rr2 = None
-    if entry and sl and tp1:
+    if entry is not None and sl is not None and tp1 is not None:
         risk = abs(entry - sl)
         if risk > 0:
             rr1 = abs(tp1 - entry) / risk
-    if entry and sl and tp2:
+    if entry is not None and sl is not None and tp2 is not None:
         risk = abs(entry - sl)
         if risk > 0:
             rr2 = abs(tp2 - entry) / risk
@@ -117,34 +127,31 @@ def build_message(symbol, label, price, bar_time, r):
     p = r["poi"]
     c = r["confirmation"]
     t = r["trade_idea"]
+
     kz = n.get("kill_zone") or "Outside kill zone"
     ls = n.get("london_sweep")
     fvgm = n.get("fvg_momentum")
 
-    lines = [
-        f"<b>📡 SMC ALERT v2 — {label}</b>",
-        f"Price: <b>{price:.5f}</b>  |  {bar_time}",
-        "",
-        f"<b>【 PILLAR 1 — BIAS 】</b>",
-        f"  Daily  {bias_emoji(b.get('daily'))}  {b.get('daily','?').upper()}",
-        f"  4H     {bias_emoji(b.get('4h'))}  {b.get('4h','?').upper()}",
-        f"  1H     {bias_emoji(b.get('1h'))}  {b.get('1h','?').upper()}",
-        f"  15min  {bias_emoji(b.get('15min'))}  {b.get('15min','?').upper()}",
-        f"  → <b>{a['label']}</b>  ({a['score']}/4 aligned)",
-        "",
-        f"<b>【 PILLAR 2 — NARRATIVE 】</b>",
-        f"  Kill zone: <b>{kz}</b>",
-    ]
+    msg = f"<b>SMC ALERT v2 - {label}</b>\n"
+    msg += f"Price: <b>{price:.5f}</b> | {bar_time}\n\n"
 
+    msg += "<b>PILLAR 1 - BIAS</b>\n"
+    msg += f"  Daily  {bias_emoji(b.get('daily'))} {str(b.get('daily','-')).upper()}\n"
+    msg += f"  4H     {bias_emoji(b.get('4h'))} {str(b.get('4h','-')).upper()}\n"
+    msg += f"  1H     {bias_emoji(b.get('1h'))} {str(b.get('1h','-')).upper()}\n"
+    msg += f"  15min  {bias_emoji(b.get('15min'))} {str(b.get('15min','-')).upper()}\n"
+    msg += f"  Result: <b>{a['label']}</b> ({a['score']}/4)\n\n"
+
+    msg += "<b>PILLAR 2 - NARRATIVE</b>\n"
+    msg += f"  Kill zone: <b>{kz}</b>\n"
     if ls == "swept_high":
-        lines.append("  🟡 London swept Asian HIGH → expect move DOWN")
+        msg += "  London swept Asian HIGH - expect DOWN\n"
     elif ls == "swept_low":
-        lines.append("  🟡 London swept Asian LOW → expect move UP")
+        msg += "  London swept Asian LOW - expect UP\n"
     if fvgm:
-        lines.append(f"  📊 {fvgm}")
+        msg += f"  {fvgm}\n"
 
-    lines += ["", "<b>【 PILLAR 3 — POINTS OF INTEREST 】</b>"]
-
+    msg += "\n<b>PILLAR 3 - POI</b>\n"
     bull_ob = p.get("bull_ob_1h")
     bear_ob = p.get("bear_ob_1h")
     bull_fvg = p.get("bull_fvg_1h")
@@ -153,23 +160,22 @@ def build_message(symbol, label, price, bar_time, r):
     pl = p.get("prev_session_low")
 
     if bull_ob:
-        lines.append(f"  🟢 Bullish OB (1H): {bull_ob['bot']:.5f} – {bull_ob['top']:.5f}")
+        msg += f"  Bullish OB (1H): {bull_ob['bot']:.5f} - {bull_ob['top']:.5f}\n"
     if bull_fvg:
-        lines.append(f"  🔵 Bullish FVG (1H): {bull_fvg['bot']:.5f} – {bull_fvg['top']:.5f}")
+        msg += f"  Bullish FVG (1H): {bull_fvg['bot']:.5f} - {bull_fvg['top']:.5f}\n"
     if bear_ob:
-        lines.append(f"  🔴 Bearish OB (1H): {bear_ob['bot']:.5f} – {bear_ob['top']:.5f}")
+        msg += f"  Bearish OB (1H): {bear_ob['bot']:.5f} - {bear_ob['top']:.5f}\n"
     if bear_fvg:
-        lines.append(f"  🟠 Bearish FVG (1H): {bear_fvg['bot']:.5f} – {bear_fvg['top']:.5f}")
+        msg += f"  Bearish FVG (1H): {bear_fvg['bot']:.5f} - {bear_fvg['top']:.5f}\n"
     if ph:
-        lines.append(f"  📌 Prev session high: {ph:.5f}  (BSL target)")
+        msg += f"  Prev session high: {ph:.5f} (BSL target)\n"
     if pl:
-        lines.append(f"  📌 Prev session low:  {pl:.5f}  (SSL target)")
+        msg += f"  Prev session low: {pl:.5f} (SSL target)\n"
     for lvl in p.get("equal_levels_4h", [])[:2]:
-        tag = "Equal Highs (BSL)" if lvl["type"] == "eq_high" else "Equal Lows (SSL)"
-        lines.append(f"  ⚡ {tag}: {lvl['level']:.5f}  ({lvl['count']}x touched)")
+        tag = "Equal Highs" if lvl["type"] == "eq_high" else "Equal Lows"
+        msg += f"  {tag}: {lvl['level']:.5f} ({lvl['count']}x)\n"
 
-    lines += ["", "<b>【 PILLAR 4 — CONFIRMATION 】</b>"]
-
+    msg += "\n<b>PILLAR 4 - CONFIRMATION</b>\n"
     sc15 = c.get("sweep_choch_15min")
     sc1h = c.get("sweep_choch_1h")
     eng = c.get("engulfing_15min")
@@ -177,67 +183,59 @@ def build_message(symbol, label, price, bar_time, r):
     brf15 = c.get("bear_fvg_15min")
 
     if sc15 == "bullish_reversal":
-        lines.append("  ✅ Sweep + CHoCH (15min) → BULLISH REVERSAL confirmed")
+        msg += "  Sweep+CHoCH (15min) - BULLISH\n"
     if sc15 == "bearish_reversal":
-        lines.append("  ✅ Sweep + CHoCH (15min) → BEARISH REVERSAL confirmed")
+        msg += "  Sweep+CHoCH (15min) - BEARISH\n"
     if sc1h == "bullish_reversal":
-        lines.append("  ✅ Sweep + CHoCH (1H) → BULLISH REVERSAL confirmed")
+        msg += "  Sweep+CHoCH (1H) - BULLISH\n"
     if sc1h == "bearish_reversal":
-        lines.append("  ✅ Sweep + CHoCH (1H) → BEARISH REVERSAL confirmed")
+        msg += "  Sweep+CHoCH (1H) - BEARISH\n"
     if eng == "bullish_engulfing":
-        lines.append("  📗 Bullish engulfing candle (15min)")
+        msg += "  Bullish engulfing (15min)\n"
     if eng == "bearish_engulfing":
-        lines.append("  📕 Bearish engulfing candle (15min)")
+        msg += "  Bearish engulfing (15min)\n"
     if bf15:
-        lines.append(f"  🔵 LTF Bull FVG (15min): {bf15['bot']:.5f} – {bf15['top']:.5f}")
+        msg += f"  Bull FVG (15min): {bf15['bot']:.5f} - {bf15['top']:.5f}\n"
     if brf15:
-        lines.append(f"  🟠 LTF Bear FVG (15min): {brf15['bot']:.5f} – {brf15['top']:.5f}")
+        msg += f"  Bear FVG (15min): {brf15['bot']:.5f} - {brf15['top']:.5f}\n"
     if not any([sc15, sc1h, eng, bf15, brf15]):
-        lines.append("  ⏳ No confirmation yet — wait for entry trigger")
+        msg += "  No confirmation yet - wait\n"
 
-    lines += ["", "─" * 30]
+    msg += "\n------------------------------\n"
 
     if t["signal"]:
         lvls = get_entry_levels(t["signal"], p, c)
-        emoji = "🟢 BUY" if t["signal"] == "BUY" else "🔴 SELL"
-        lines += [
-            f"<b>🎯 TRADE IDEA: {emoji}</b>",
-            f"  Quality:  <b>{t['quality']}</b>",
-            "",
-        ]
+        direction = "BUY" if t["signal"] == "BUY" else "SELL"
+        msg += f"<b>TRADE IDEA: {direction}</b>\n"
+        msg += f"  Quality: {t['quality']}\n\n"
         if lvls["entry"]:
-            lines.append(f"  📍 Entry:   <b>{lvls['entry']:.5f}</b>")
+            msg += f"  Entry: <b>{lvls['entry']:.5f}</b>\n"
         else:
-            lines.append(f"  📍 Entry:   Wait for price to reach POI zone")
+            msg += "  Entry: Wait for price to reach POI\n"
         if lvls["sl"]:
-            lines.append(f"  🛑 SL:      <b>{lvls['sl']:.5f}</b>")
-        else:
-            lines.append(f"  🛑 SL:      {t['sl_note']}")
+            msg += f"  SL:    <b>{lvls['sl']:.5f}</b>\n"
         if lvls["tp1"]:
-            rr_str = f"  (RR: {lvls['rr1']:.1f}R)" if lvls["rr1"] else ""
-            lines.append(f"  🎯 TP1:     <b>{lvls['tp1']:.5f}</b>{rr_str}")
+            rr = f" (RR: {lvls['rr1']:.1f}R)" if lvls["rr1"] else ""
+            msg += f"  TP1:   <b>{lvls['tp1']:.5f}</b>{rr}\n"
         if lvls["tp2"]:
-            rr_str = f"  (RR: {lvls['rr2']:.1f}R)" if lvls["rr2"] else ""
-            lines.append(f"  🎯 TP2:     <b>{lvls['tp2']:.5f}</b>{rr_str}  <- equal highs/lows")
-        if not lvls["tp1"] and not lvls["tp2"]:
-            lines.append(f"  🎯 TP:      {t['tp_note']}")
-        lines += [
-            "",
-            "  💡 Place limit order at Entry.",
-            "  💡 Move SL to BE after TP1 hit.",
-        ]
+            rr = f" (RR: {lvls['rr2']:.1f}R)" if lvls["rr2"] else ""
+            msg += f"  TP2:   <b>{lvls['tp2']:.5f}</b>{rr}\n"
+        msg += "\n  Place limit order at Entry.\n"
+        msg += "  Move SL to BE after TP1 hit.\n"
     else:
-        lines.append("<b>⏸ NO TRADE — wait for all 4 pillars to align.</b>")
+        msg += "<b>NO TRADE - wait for all 4 pillars.</b>\n"
 
-    lines += ["", "⚠️ Always confirm on chart. Manage your risk."]
-    return "\n".join(lines)
+    msg += "\nAlways confirm on chart. Manage your risk."
+    return msg
 
 
 def main():
     state = load_state()
     for symbol, label in SYMBOLS.items():
         try:
-            dfs = {tf: fetch_bars(symbol, tf, outputsize=100) for tf in TIMEFRAMES}
+            dfs = {}
+            for tf in TIMEFRAMES:
+                dfs[tf] = fetch_bars(symbol, tf, outputsize=100)
         except Exception as exc:
             print(f"Fetch error [{symbol}]: {exc}")
             continue
