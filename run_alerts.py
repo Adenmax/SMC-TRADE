@@ -59,311 +59,274 @@ def bias_emoji(b):
     return "⚪"
 
 
-def get_entry_levels(signal, poi, conf, trade):
-    entry = sl = tp1 = tp2 = None
-    buf = 0.0003
+def get_realistic_sl(signal, poi, df_15min, buffer_pct=0.0005):
+    """
+    SL based on RECENT local structure — not a distant CHoCH.
+    For BUY: just below the nearest recent swing low or OB low.
+    For SELL: just above the nearest recent swing high or OB top.
+    Uses last 20 bars of 15min to find local structure.
+    """
+    sl = None
 
-    sl = trade.get("sl_price")
+    if df_15min is not None and len(df_15min) >= 10:
+        recent_lows  = df_15min["low"].values[-20:]
+        recent_highs = df_15min["high"].values[-20:]
+
+        if signal == "BUY":
+            # SL = below the lowest recent swing low in last 20 bars
+            local_low = float(min(recent_lows))
+            # But not more than 2% below current price (realistic)
+            current = float(df_15min["close"].iloc[-2])
+            if (current - local_low) / current < 0.02:
+                sl = local_low * (1 - buffer_pct)
+
+        elif signal == "SELL":
+            local_high = float(max(recent_highs))
+            current = float(df_15min["close"].iloc[-2])
+            if (local_high - current) / current < 0.02:
+                sl = local_high * (1 + buffer_pct)
+
+    # Fallback to OB if local structure SL is too wide
+    if sl is None:
+        if signal == "BUY":
+            ob = poi.get("bull_ob_1h")
+            fvg = poi.get("bull_fvg_15min_poi") or poi.get("bull_fvg_1h")
+            if fvg:
+                sl = fvg["bot"] * (1 - buffer_pct)
+            elif ob:
+                sl = ob["bot"] * (1 - buffer_pct)
+        elif signal == "SELL":
+            ob = poi.get("bear_ob_1h")
+            fvg = poi.get("bear_fvg_15min_poi") or poi.get("bear_fvg_1h")
+            if fvg:
+                sl = fvg["top"] * (1 + buffer_pct)
+            elif ob:
+                sl = ob["top"] * (1 + buffer_pct)
+
+    return sl
+
+
+def get_entry_and_tp(signal, poi, session_levels):
+    entry = tp1 = tp2 = None
 
     if signal == "BUY":
-        f15 = poi.get("bull_fvg_15min_poi") or conf.get("bull_fvg_15min")
-        f1h = poi.get("bull_fvg_1h")
-        ob  = poi.get("bull_ob_1h")
-        if f15:
-            entry = f15["top"]
-        elif f1h:
-            entry = f1h["top"]
-        elif ob:
-            entry = (ob["top"] + ob["bot"]) / 2
-        tp1 = poi.get("prev_session_high")
-        eq  = [e for e in poi.get("equal_levels_4h", []) if e["type"] == "eq_high"]
-        tp2 = eq[0]["level"] if eq else None
-        ns  = poi.get("nearest_session_zone")
-        if ns and ns[1] and (tp1 is None or abs(ns[1] - (entry or 0)) < abs((tp1 or 0) - (entry or 0))):
-            tp1 = ns[1]
-
-    if signal == "SELL":
-        f15 = poi.get("bear_fvg_15min_poi") or conf.get("bear_fvg_15min")
-        f1h = poi.get("bear_fvg_1h")
-        ob  = poi.get("bear_ob_1h")
-        if f15:
-            entry = f15["bot"]
-        elif f1h:
-            entry = f1h["bot"]
-        elif ob:
-            entry = (ob["top"] + ob["bot"]) / 2
-        tp1 = poi.get("prev_session_low")
-        eq  = [e for e in poi.get("equal_levels_4h", []) if e["type"] == "eq_low"]
-        tp2 = eq[0]["level"] if eq else None
-        ns  = poi.get("nearest_session_zone")
-        if ns and ns[1] and (tp1 is None or abs(ns[1] - (entry or 0)) < abs((tp1 or 0) - (entry or 0))):
-            tp1 = ns[1]
-
-    rr1 = rr2 = None
-    if entry and sl and tp1:
-        risk = abs(entry - sl)
-        if risk > 0:
-            rr1 = abs(tp1 - entry) / risk
-    if entry and sl and tp2:
-        risk = abs(entry - sl)
-        if risk > 0:
-            rr2 = abs(tp2 - entry) / risk
-
-    return {"entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "rr1": rr1, "rr2": rr2}
-
-
-def build_watch_next(signal, score, direction, poi, conf, ls, session_levels):
-    lines = ["\n<b>WHAT TO DO NOW</b>"]
-    eq_highs = [e for e in poi.get("equal_levels_4h", []) if e["type"] == "eq_high"]
-    eq_lows  = [e for e in poi.get("equal_levels_4h", []) if e["type"] == "eq_low"]
-    ph = poi.get("prev_session_high")
-    pl = poi.get("prev_session_low")
-    retest = conf.get("choch_retest", False)
-
-    if signal:
-        lines.append("✅ Setup detected. Your action plan:")
-        if signal == "BUY":
-            lines.append("1. Open TradingView → XAU/USD or GBP/JPY → 15min chart")
-            lines.append("2. Find the Bullish OB or 15min iFVG BUY zone")
-            lines.append("3. Wait for price to tap into the zone")
-            lines.append("4. On the 1, 3, or 5min chart look for:")
-            lines.append("   → Lower lows forming, then price breaks the most recent lower high")
-            lines.append("   → BODY candle close above that lower high = CHoCH confirmed")
-            if retest:
-                lines.append("   ★ CHoCH retest already detected — entry may be now")
-            else:
-                lines.append("   → Then wait for a RETEST of that level before entering")
-            lines.append("5. Place BUY LIMIT at entry price shown below")
-            lines.append("6. SL below the CHoCH structural low")
-            lines.append("7. TP1 = nearest session high ($$$ magnet)")
-            lines.append("8. Move SL to breakeven after TP1 hit")
-        else:
-            lines.append("1. Open TradingView → XAU/USD or GBP/JPY → 15min chart")
-            lines.append("2. Find the Bearish OB or 15min iFVG SELL zone")
-            lines.append("3. Wait for price to tap into the zone")
-            lines.append("4. On the 1, 3, or 5min chart look for:")
-            lines.append("   → Higher highs forming, then price breaks the most recent higher low")
-            lines.append("   → BODY candle close below that higher low = CHoCH confirmed")
-            if retest:
-                lines.append("   ★ CHoCH retest already detected — entry may be now")
-            else:
-                lines.append("   → Then wait for a RETEST of that level before entering")
-            lines.append("5. Place SELL LIMIT at entry price shown below")
-            lines.append("6. SL above the CHoCH structural high")
-            lines.append("7. TP1 = nearest session low ($$$ magnet)")
-            lines.append("8. Move SL to breakeven after TP1 hit")
-
-    elif score <= 1:
-        lines.append("⚪ Timeframes MIXED — this is a ranging market.")
-        lines.append("DO NOT trade. Watch for price to sweep one of these levels:")
-        if eq_highs:
-            lines.append(f"  $$$ Equal Highs at {eq_highs[0]['level']:.5f}")
-            lines.append("      → Wick above + body close below = BEARISH SWEEP")
-            lines.append("        Then look for SELL setup on 1/3/5min CHoCH")
-        if eq_lows:
-            lines.append(f"  $$$ Equal Lows at {eq_lows[0]['level']:.5f}")
-            lines.append("      → Wick below + body close above = BULLISH SWEEP")
-            lines.append("        Then look for BUY setup on 1/3/5min CHoCH")
-        lines.append("  Wait for next alert when 3+ TFs agree on direction.")
-
-    elif score >= 3 and direction == "bullish":
-        lines.append("🟢 Bias BULLISH. Waiting for price to tap buy zone.")
-        ob  = poi.get("bull_ob_1h")
-        fvg = poi.get("bull_fvg_15min_poi") or poi.get("bull_fvg_1h")
+        fvg = poi.get("bull_fvg_15min_poi")
+        fvg1h = poi.get("bull_fvg_1h")
+        ob = poi.get("bull_ob_1h")
         if fvg:
-            lines.append(f"  Watch BUY ZONE: {fvg['bot']:.5f} - {fvg['top']:.5f}")
+            entry = round(fvg["top"], 5)
+        elif fvg1h:
+            entry = round(fvg1h["top"], 5)
         elif ob:
-            lines.append(f"  Watch Bullish OB: {ob['bot']:.5f} - {ob['top']:.5f}")
-        if pl:
-            lines.append(f"  Also watching session low $$$ at {pl:.5f}")
-        lines.append("  Once tapped → look for 1/3/5min CHoCH body close → retest → BUY")
+            entry = round((ob["top"] + ob["bot"]) / 2, 5)
 
-    elif score >= 3 and direction == "bearish":
-        lines.append("🔴 Bias BEARISH. Waiting for price to tap sell zone.")
-        ob  = poi.get("bear_ob_1h")
-        fvg = poi.get("bear_fvg_15min_poi") or poi.get("bear_fvg_1h")
+        # TP1 = nearest session HIGH above entry
+        candidates = []
+        for name, lvl in session_levels.items():
+            if entry and lvl["high"] > entry:
+                candidates.append((name, lvl["high"], lvl["high"] - entry))
+        if candidates:
+            candidates.sort(key=lambda x: x[2])
+            tp1 = round(candidates[0][1], 5)
+
+        # TP2 = prev day high or equal highs
+        ph = poi.get("prev_session_high")
+        eq = [e for e in poi.get("equal_levels_4h", []) if e["type"] == "eq_high"]
+        if ph and entry and ph > entry:
+            tp2 = round(ph, 5)
+        elif eq and entry:
+            tp2 = round(eq[0]["level"], 5)
+
+    elif signal == "SELL":
+        fvg = poi.get("bear_fvg_15min_poi")
+        fvg1h = poi.get("bear_fvg_1h")
+        ob = poi.get("bear_ob_1h")
         if fvg:
-            lines.append(f"  Watch SELL ZONE: {fvg['bot']:.5f} - {fvg['top']:.5f}")
+            entry = round(fvg["bot"], 5)
+        elif fvg1h:
+            entry = round(fvg1h["bot"], 5)
         elif ob:
-            lines.append(f"  Watch Bearish OB: {ob['bot']:.5f} - {ob['top']:.5f}")
-        if ph:
-            lines.append(f"  Also watching session high $$$ at {ph:.5f}")
-        lines.append("  Once tapped → look for 1/3/5min CHoCH body close → retest → SELL")
+            entry = round((ob["top"] + ob["bot"]) / 2, 5)
 
-    if ls == "swept_high":
-        lines.append("\n🟡 London swept Asian HIGH → bias for DOWN this session")
-    elif ls == "swept_low":
-        lines.append("\n🟡 London swept Asian LOW → bias for UP this session")
+        # TP1 = nearest session LOW below entry
+        candidates = []
+        for name, lvl in session_levels.items():
+            if entry and lvl["low"] < entry:
+                candidates.append((name, lvl["low"], entry - lvl["low"]))
+        if candidates:
+            candidates.sort(key=lambda x: x[2])
+            tp1 = round(candidates[0][1], 5)
 
-    lines.append("\nOpen TradingView to verify before entering any trade.")
-    return "\n".join(lines)
+        pl = poi.get("prev_session_low")
+        eq = [e for e in poi.get("equal_levels_4h", []) if e["type"] == "eq_low"]
+        if pl and entry and pl < entry:
+            tp2 = round(pl, 5)
+        elif eq and entry:
+            tp2 = round(eq[0]["level"], 5)
+
+    return entry, tp1, tp2
 
 
-def build_message(symbol, label, price, bar_time, r):
-    a   = r["alignment"]
-    b   = r["bias"]
-    n   = r["narrative"]
-    p   = r["poi"]
-    c   = r["confirmation"]
-    t   = r["trade_idea"]
-    d   = r["decision"]
-    kz  = n.get("kill_zone") or "Outside kill zone"
-    ls  = n.get("london_sweep")
-    fvgm = n.get("fvg_momentum")
-    amd  = n.get("amd_context", False)
-    sl   = n.get("session_levels", {})
+def calc_rr(entry, sl, tp):
+    if entry and sl and tp:
+        risk = abs(entry - sl)
+        reward = abs(tp - entry)
+        if risk > 0:
+            return round(reward / risk, 1)
+    return None
 
-    msg  = f"<b>SMC ALERT — {label}</b>\n"
-    msg += f"Price: <b>{price:.5f}</b> | {bar_time}\n\n"
 
-    # PILLAR 1
-    msg += "<b>PILLAR 1 — BIAS</b>\n"
-    msg += f"  Daily  {bias_emoji(b.get('daily'))} {str(b.get('daily','-')).upper()}\n"
-    msg += f"  4H     {bias_emoji(b.get('4h'))} {str(b.get('4h','-')).upper()}\n"
-    msg += f"  1H     {bias_emoji(b.get('1h'))} {str(b.get('1h','-')).upper()}\n"
-    msg += f"  15min  {bias_emoji(b.get('15min'))} {str(b.get('15min','-')).upper()}\n"
-    msg += f"  → <b>{a['label']}</b> ({a['score']}/4)\n\n"
+def get_confirmation_summary(conf):
+    """Single line confirmation status."""
+    sc15, _ = conf.get("sweep_choch_15min", (None, None))
+    sc1h, _ = conf.get("sweep_choch_1h",    (None, None))
+    ic,   _ = conf.get("internal_choch",     (None, None))
+    eng     = conf.get("engulfing_15min")
+    retest  = conf.get("choch_retest", False)
 
-    # PILLAR 2
-    msg += "<b>PILLAR 2 — NARRATIVE</b>\n"
-    msg += f"  Kill zone: <b>{kz}</b>\n"
-    if amd:
-        msg += "  ⚠️ HTF ranging — AMD context (wait for manipulation sweep)\n"
-    if ls == "swept_high":
-        msg += "  🟡 London swept Asian HIGH → expect move DOWN\n"
-    elif ls == "swept_low":
-        msg += "  🟡 London swept Asian LOW → expect move UP\n"
-    if fvgm:
-        msg += f"  {fvgm}\n"
-
-    # Session liquidity ($$$ markers)
-    if sl:
-        msg += "\n  <b>$$$ Session Liquidity Levels:</b>\n"
-        for sname, slvl in sl.items():
-            msg += f"    {sname}: H={slvl['high']:.5f}  L={slvl['low']:.5f}\n"
-
-    # PILLAR 3
-    msg += "\n<b>PILLAR 3 — POINTS OF INTEREST</b>\n"
-    bull_ob  = p.get("bull_ob_1h")
-    bear_ob  = p.get("bear_ob_1h")
-    bull_fvg = p.get("bull_fvg_1h")
-    bear_fvg = p.get("bear_fvg_1h")
-    b15_poi  = p.get("bull_fvg_15min_poi")
-    br15_poi = p.get("bear_fvg_15min_poi")
-    b15_un   = p.get("bull_fvg_15min_untapped")
-    br15_un  = p.get("bear_fvg_15min_untapped")
-
-    if b15_poi:
-        msg += f"  ★ BUY ZONE (15min iFVG): {b15_poi['bot']:.5f} - {b15_poi['top']:.5f}\n"
-    if br15_poi:
-        msg += f"  ★ SELL ZONE (15min iFVG): {br15_poi['bot']:.5f} - {br15_poi['top']:.5f}\n"
-    if bull_ob:
-        msg += f"  Bullish OB (1H): {bull_ob['bot']:.5f} - {bull_ob['top']:.5f}\n"
-    if bull_fvg:
-        msg += f"  Bullish FVG (1H): {bull_fvg['bot']:.5f} - {bull_fvg['top']:.5f}\n"
-    if bear_ob:
-        msg += f"  Bearish OB (1H): {bear_ob['bot']:.5f} - {bear_ob['top']:.5f}\n"
-    if bear_fvg:
-        msg += f"  Bearish FVG (1H): {bear_fvg['bot']:.5f} - {bear_fvg['top']:.5f}\n"
-    if b15_un:
-        msg += f"  Bull FVG target (15min): {b15_un['bot']:.5f} - {b15_un['top']:.5f}\n"
-    if br15_un:
-        msg += f"  Bear FVG target (15min): {br15_un['bot']:.5f} - {br15_un['top']:.5f}\n"
-
-    all_bprs = p.get("bpr_1h", []) + p.get("bpr_15min", [])
-    for bpr in all_bprs[:2]:
-        msg += f"  ⚡ BPR ({bpr['direction'].upper()}): {bpr['bot']:.5f} - {bpr['top']:.5f}\n"
-
-    ph = p.get("prev_session_high")
-    pl = p.get("prev_session_low")
-    if ph:
-        msg += f"  Prev day high: {ph:.5f} (BSL)\n"
-    if pl:
-        msg += f"  Prev day low:  {pl:.5f} (SSL)\n"
-
-    for lvl in p.get("equal_levels_4h", [])[:2]:
-        tag = "Equal Highs" if lvl["type"] == "eq_high" else "Equal Lows"
-        msg += f"  $$$ {tag}: {lvl['level']:.5f} ({lvl['count']}x)\n"
-
-    ns = p.get("nearest_session_zone")
-    if ns and ns[1]:
-        msg += f"  → Nearest $$$ magnet: {ns[0]} at {ns[1]:.5f}\n"
-
-    # PILLAR 4
-    msg += "\n<b>PILLAR 4 — CONFIRMATION</b>\n"
-    sc15_r, cl15 = c.get("sweep_choch_15min", (None, None))
-    sc1h_r, cl1h = c.get("sweep_choch_1h",    (None, None))
-    ic_r, icl    = c.get("internal_choch",     (None, None))
-    eng          = c.get("engulfing_15min")
-    retest       = c.get("choch_retest", False)
-    sl_mag       = c.get("sl_near_magnet", False)
-
-    if sc15_r == "bullish_reversal":
-        msg += f"  ✅ [1] Sweep+CHoCH (15min) BULLISH — body close confirmed\n"
-        if cl15: msg += f"      CHoCH level: {cl15:.5f}\n"
-    if sc15_r == "bearish_reversal":
-        msg += f"  ✅ [1] Sweep+CHoCH (15min) BEARISH — body close confirmed\n"
-        if cl15: msg += f"      CHoCH level: {cl15:.5f}\n"
-    if sc1h_r == "bullish_reversal":
-        msg += f"  ✅ [1] Sweep+CHoCH (1H) BULLISH — body close confirmed\n"
-        if cl1h: msg += f"      CHoCH level: {cl1h:.5f}\n"
-    if sc1h_r == "bearish_reversal":
-        msg += f"  ✅ [1] Sweep+CHoCH (1H) BEARISH — body close confirmed\n"
-        if cl1h: msg += f"      CHoCH level: {cl1h:.5f}\n"
-    if ic_r == "bullish_internal_choch":
-        msg += f"  ✅ [1] Internal CHoCH (5min) BULLISH\n"
-    if ic_r == "bearish_internal_choch":
-        msg += f"  ✅ [1] Internal CHoCH (5min) BEARISH\n"
+    parts = []
+    if sc15 in ("bullish_reversal", "bearish_reversal"):
+        direction = "Bull" if sc15 == "bullish_reversal" else "Bear"
+        parts.append(f"{direction} CHoCH (15min) ✅")
+    if sc1h in ("bullish_reversal", "bearish_reversal"):
+        direction = "Bull" if sc1h == "bullish_reversal" else "Bear"
+        parts.append(f"{direction} CHoCH (1H) ✅")
+    if ic in ("bullish_internal_choch", "bearish_internal_choch"):
+        direction = "Bull" if "bullish" in ic else "Bear"
+        parts.append(f"{direction} internal CHoCH (5min) ✅")
     if retest:
-        msg += "  ✅ [2] CHoCH retest complete — HIGHEST CONFIDENCE\n"
+        parts.append("Retest confirmed ✅")
     if eng == "bullish_engulfing":
-        msg += "  ✅ [3] Bullish engulfing (15min)\n"
+        parts.append("Bull engulfing ✅")
     if eng == "bearish_engulfing":
-        msg += "  ✅ [3] Bearish engulfing (15min)\n"
-    if sl_mag:
-        msg += "  ⚠️ SL near session level (magnet) — adjust or skip!\n"
-    if not any([sc15_r, sc1h_r, ic_r, eng]):
-        msg += "  ⏳ No confirmation yet — wait for 1/3/5min CHoCH\n"
+        parts.append("Bear engulfing ✅")
+    return ", ".join(parts) if parts else "Waiting for confirmation"
 
-    msg += "\n——————————————————————\n"
 
-    # TRADE IDEA
-    if t["signal"]:
-        lvls = get_entry_levels(t["signal"], p, c, t)
-        direction = "BUY" if t["signal"] == "BUY" else "SELL"
-        msg += f"<b>TRADE: {direction}</b>  Quality: {t['quality']}\n\n"
-        if lvls["entry"]:
-            msg += f"  Entry:  <b>{lvls['entry']:.5f}</b>\n"
+def build_message(symbol, label, price, bar_time, r, df_15min):
+    a  = r["alignment"]
+    b  = r["bias"]
+    n  = r["narrative"]
+    p  = r["poi"]
+    c  = r["confirmation"]
+    t  = r["trade_idea"]
+    sl = n.get("session_levels", {})
+    kz = n.get("kill_zone") or "Outside kill zone"
+    ls = n.get("london_sweep")
+
+    signal = t.get("signal")
+
+    # ── CLEAN SIMPLE FORMAT ──────────────────────────────────────────────────
+    if signal:
+        emoji = "🟢 BUY" if signal == "BUY" else "🔴 SELL"
+        entry, tp1, tp2 = get_entry_and_tp(signal, p, sl)
+        sl_price = get_realistic_sl(signal, p, df_15min)
+
+        rr1 = calc_rr(entry, sl_price, tp1)
+        rr2 = calc_rr(entry, sl_price, tp2)
+
+        conf_summary = get_confirmation_summary(c)
+        quality = t.get("quality", "")
+
+        # Bias line
+        bias_line = f"{bias_emoji(b.get('daily'))}D " \
+                    f"{bias_emoji(b.get('4h'))}4H " \
+                    f"{bias_emoji(b.get('1h'))}1H " \
+                    f"{bias_emoji(b.get('15min'))}15m"
+
+        # Zone description
+        fvg15 = p.get(f"{'bull' if signal == 'BUY' else 'bear'}_fvg_15min_poi")
+        ob1h  = p.get(f"{'bull' if signal == 'BUY' else 'bear'}_ob_1h")
+        zone_parts = []
+        if fvg15:
+            zone_parts.append(f"15min iFVG {fvg15['bot']:.2f}-{fvg15['top']:.2f}")
+        if ob1h:
+            zone_parts.append(f"1H OB {ob1h['bot']:.2f}-{ob1h['top']:.2f}")
+        zone_str = " + ".join(zone_parts) if zone_parts else "See chart"
+
+        msg  = f"<b>{emoji} — {label}</b>\n"
+        msg += f"Price: <b>{price:.2f}</b>  |  {kz}  |  {a['score']}/4 TF\n"
+        msg += f"Bias: {bias_line}\n\n"
+
+        msg += f"<b>ZONE:</b> {zone_str}\n"
+        msg += f"<b>Confirmation:</b> {conf_summary}\n\n"
+
+        msg += f"<b>Entry:</b>  {entry:.2f}\n" if entry else "<b>Entry:</b>  Tap zone first\n"
+        msg += f"<b>SL:</b>     {sl_price:.2f}\n" if sl_price else "<b>SL:</b>     Below zone\n"
+        if tp1:
+            rr_str = f"  ({rr1}R)" if rr1 else ""
+            msg += f"<b>TP1:</b>    {tp1:.2f}{rr_str}\n"
+        if tp2:
+            rr_str = f"  ({rr2}R)" if rr2 else ""
+            msg += f"<b>TP2:</b>    {tp2:.2f}{rr_str}\n"
+
+        msg += f"\n<b>Quality:</b> {quality}\n"
+
+        if ls == "swept_high":
+            msg += "🟡 London swept Asian HIGH\n"
+        elif ls == "swept_low":
+            msg += "🟡 London swept Asian LOW\n"
+
+        if c.get("sl_near_magnet"):
+            msg += "⚠️ SL near session level — widen SL\n"
+
+        if n.get("amd_context"):
+            msg += "⚠️ HTF ranging — watch for fake CHoCH\n"
+
+        msg += "\n<b>Next step:</b> "
+        if c.get("choch_retest"):
+            msg += "CHoCH retest done → enter now at Entry price"
         else:
-            msg += "  Entry:  Wait for price to tap zone\n"
-        if lvls["sl"]:
-            msg += f"  SL:     <b>{lvls['sl']:.5f}</b>\n"
-        if lvls["tp1"]:
-            rr = f" ({lvls['rr1']:.1f}R)" if lvls["rr1"] else ""
-            msg += f"  TP1:    <b>{lvls['tp1']:.5f}</b>{rr}\n"
-        if lvls["tp2"]:
-            rr = f" ({lvls['rr2']:.1f}R)" if lvls["rr2"] else ""
-            msg += f"  TP2:    <b>{lvls['tp2']:.5f}</b>{rr}\n"
-        if t.get("counter_trend"):
-            msg += "  ⚡ Counter-trend setup — use tight SL\n"
+            msg += f"On 1/3/5min → wait for CHoCH body close → retest → enter"
+
+        msg += "\n\nAlways confirm on chart before entering."
+
     else:
-        msg += "<b>NO TRADE YET</b>\n"
+        # No trade — keep it very short
+        bias_line = f"{bias_emoji(b.get('daily'))}D " \
+                    f"{bias_emoji(b.get('4h'))}4H " \
+                    f"{bias_emoji(b.get('1h'))}1H " \
+                    f"{bias_emoji(b.get('15min'))}15m"
 
-    # 5TH QUESTION — WILL I TAKE THIS TRADE?
-    if d.get("pros") or d.get("cons"):
-        msg += "\n<b>WILL I TAKE THIS TRADE?</b>\n"
-        for pro in d.get("pros", []):
-            msg += f"  ✅ {pro}\n"
-        for con in d.get("cons", []):
-            msg += f"  ❌ {con}\n"
-        msg += f"\n  → <b>{d.get('recommendation','')}</b>\n"
+        msg  = f"<b>📊 {label} — MONITORING</b>\n"
+        msg += f"Price: <b>{price:.2f}</b>  |  {kz}\n"
+        msg += f"Bias: {bias_line}  ({a['score']}/4)\n\n"
 
-    # WHAT TO DO NOW
-    msg += build_watch_next(
-        t["signal"], a["score"], a["direction"], p, c, ls,
-        n.get("session_levels", {}))
+        if n.get("amd_context"):
+            msg += "⚠️ HTF ranging — AMD context\n"
+            msg += "Wait for London/NY to sweep a session level\n"
+            eq_h = [e for e in p.get("equal_levels_4h", []) if e["type"] == "eq_high"]
+            eq_l = [e for e in p.get("equal_levels_4h", []) if e["type"] == "eq_low"]
+            if eq_h:
+                msg += f"Watch equal highs (BSL): {eq_h[0]['level']:.2f}\n"
+            if eq_l:
+                msg += f"Watch equal lows (SSL):  {eq_l[0]['level']:.2f}\n"
+        elif a["score"] >= 3:
+            direction = a["direction"]
+            if direction == "bullish":
+                ob  = p.get("bull_ob_1h")
+                fvg = p.get("bull_fvg_15min_poi") or p.get("bull_fvg_1h")
+                zone = fvg or ob
+                msg += f"🟢 Bias BULLISH — waiting for buy zone tap\n"
+                if zone:
+                    msg += f"Buy zone: {zone['bot']:.2f} - {zone['top']:.2f}\n"
+                msg += "Once tapped → 1/3/5min CHoCH body close → retest → BUY"
+            else:
+                ob  = p.get("bear_ob_1h")
+                fvg = p.get("bear_fvg_15min_poi") or p.get("bear_fvg_1h")
+                zone = fvg or ob
+                msg += f"🔴 Bias BEARISH — waiting for sell zone tap\n"
+                if zone:
+                    msg += f"Sell zone: {zone['bot']:.2f} - {zone['top']:.2f}\n"
+                msg += "Once tapped → 1/3/5min CHoCH body close → retest → SELL"
+        else:
+            msg += "No clear bias. Sit out and wait for next alert."
 
-    msg += "\n\nAlways confirm on chart. Manage your risk."
+        if ls == "swept_high":
+            msg += "\n🟡 London swept Asian HIGH → favor SELL"
+        elif ls == "swept_low":
+            msg += "\n🟡 London swept Asian LOW → favor BUY"
+
     return msg
 
 
@@ -402,19 +365,44 @@ def main():
         sc1h, _ = conf.get("sweep_choch_1h",    (None, None))
         ic,   _ = conf.get("internal_choch",     (None, None))
 
-        has_signal = (
-            r["trade_idea"]["signal"] is not None
-            or sc15 is not None
-            or sc1h is not None
-            or ic is not None
-            or conf.get("engulfing_15min") is not None
+        # Only alert when FULL confirmation is complete:
+        # 1. Trade idea exists (zone + bias + CHoCH detected)
+        # 2. CHoCH retest confirmed OR engulfing candle (entry-ready)
+        # Bot stays silent until all conditions are met.
+        retest_done = conf.get("choch_retest", False)
+        engulfing   = conf.get("engulfing_15min")
+        trade_ready = r["trade_idea"]["signal"] is not None
+
+        has_signal = trade_ready and (retest_done or engulfing is not None)
+
+        # Monitoring alert: bias confirmed + zone exists but waiting
+        # Send once per session so you know what to watch
+        monitoring = (
+            not has_signal
+            and r["alignment"]["score"] >= 3
+            and (
+                r["poi"].get("bull_fvg_15min_poi") is not None
+                or r["poi"].get("bear_fvg_15min_poi") is not None
+                or r["poi"].get("bull_ob_1h") is not None
+                or r["poi"].get("bear_ob_1h") is not None
+            )
         )
 
         if has_signal:
             price = float(df_15min["close"].iloc[-2])
-            msg   = build_message(symbol, label, price, bar_time, r)
+            msg   = build_message(symbol, label, price, bar_time, r, df_15min)
             send_telegram(msg)
             print(f"Alert sent for {symbol} at {bar_time}")
+        elif monitoring:
+            last_monitor = state.get(symbol, {}).get("last_monitor_session")
+            kz = r["narrative"].get("kill_zone")
+            monitor_key = f"{bar_time[:13]}_{kz}"
+            if last_monitor != monitor_key:
+                price = float(df_15min["close"].iloc[-2])
+                msg   = build_message(symbol, label, price, bar_time, r, df_15min)
+                send_telegram(msg)
+                state.setdefault(symbol, {})["last_monitor_session"] = monitor_key
+                print(f"Monitoring alert sent for {symbol}")
         else:
             print(f"No signal for {symbol} at {bar_time}")
 
