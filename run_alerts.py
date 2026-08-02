@@ -25,22 +25,56 @@ def save_state(state):
         json.dump(state, f, indent=2)
 
 
-def fetch_bars(symbol, interval, outputsize=100):
-    resp = requests.get(
-        "https://api.twelvedata.com/time_series",
-        params={"symbol": symbol, "interval": interval,
-                "outputsize": outputsize, "apikey": TWELVE_DATA_API_KEY,
-                "order": "ASC"},
-        timeout=20,
-    )
-    data = resp.json()
-    if "values" not in data:
-        raise RuntimeError(f"Twelve Data error [{symbol} {interval}]: {data}")
-    df = pd.DataFrame(data["values"])
+import time
+
+def parse_df(values):
+    df = pd.DataFrame(values)
     df["datetime"] = pd.to_datetime(df["datetime"])
     for col in ["open", "high", "low", "close"]:
         df[col] = df[col].astype(float)
     return df.sort_values("datetime").reset_index(drop=True)
+
+
+def fetch_all_timeframes(symbols, timeframes, outputsize=100):
+    """
+    Fetch all symbols and timeframes using batch requests.
+    Twelve Data batch: comma-separated symbols = 1 API credit per symbol.
+    One request per timeframe = 5 requests total for both symbols.
+    5 requests < 8/min limit.
+    Returns: {symbol: {tf: df}}
+    """
+    symbol_str = ",".join(symbols)
+    result = {s: {} for s in symbols}
+
+    for i, tf in enumerate(timeframes):
+        if i > 0:
+            time.sleep(10)  # stay well under rate limit
+        try:
+            resp = requests.get(
+                "https://api.twelvedata.com/time_series",
+                params={"symbol": symbol_str, "interval": tf,
+                        "outputsize": outputsize, "apikey": TWELVE_DATA_API_KEY,
+                        "order": "ASC"},
+                timeout=30,
+            )
+            data = resp.json()
+            if data.get("code") == 429:
+                print(f"Rate limit on {tf}, waiting 30s...")
+                time.sleep(30)
+                continue
+            # Batch response: {symbol: {values: [...]}}
+            # Single symbol response: {values: [...]}
+            for sym in symbols:
+                if sym in data and "values" in data[sym]:
+                    result[sym][tf] = parse_df(data[sym]["values"])
+                elif "values" in data and len(symbols) == 1:
+                    result[sym][tf] = parse_df(data["values"])
+                else:
+                    print(f"No data for {sym} {tf}")
+        except Exception as e:
+            print(f"Fetch error {tf}: {e}")
+
+    return result
 
 
 def send_telegram(text):
@@ -332,14 +366,12 @@ def build_message(symbol, label, price, bar_time, r, df_15min):
 
 def main():
     state = load_state()
+
+    # Fetch all symbols and timeframes in batch (5 requests total)
+    all_data = fetch_all_timeframes(list(SYMBOLS.keys()), TIMEFRAMES)
+
     for symbol, label in SYMBOLS.items():
-        try:
-            dfs = {}
-            for tf in TIMEFRAMES:
-                dfs[tf] = fetch_bars(symbol, tf, outputsize=100)
-        except Exception as exc:
-            print(f"Fetch error [{symbol}]: {exc}")
-            continue
+        dfs = all_data.get(symbol, {})
 
         df_15min = dfs.get("15min")
         if df_15min is None or len(df_15min) < 20:
