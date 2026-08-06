@@ -317,7 +317,7 @@ def get_session_levels(df_1h):
     return result
 
 
-def get_tp_target(direction, current_price, session_levels, df_4h):
+def get_tp_target(direction, current_price, session_levels, df_4h, df_1h=None):
     """
     TP = next session liquidity level in the direction of trade.
     Mentor always targets the next $$$ level.
@@ -346,7 +346,7 @@ def get_tp_target(direction, current_price, session_levels, df_4h):
 
 # ── MASTER ANALYSIS ───────────────────────────────────────────────────────────
 def run_full_analysis(df_daily, df_4h, df_1h, df_15min,
-                      df_5min=None, df_1min=None, df_1h_ref=None):
+                      df_5min=None, df_1min=None):
     result = {
         "bias":         {},
         "kill_zone":    None,
@@ -452,7 +452,7 @@ def run_full_analysis(df_daily, df_4h, df_1h, df_15min,
 
             # TP: next session liquidity
             tp = get_tp_target(conf_direction, current_price,
-                               session_levels, df_4h, df_1h)
+                               session_levels, df_4h, df_1h=df_1h)
             if tp: tp = round(tp, 2)
 
             # Quality: HIGH if both FVG+OB in zone, MEDIUM if only one
